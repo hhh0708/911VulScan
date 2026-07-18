@@ -1,0 +1,89 @@
+name: gitleaks
+on:
+  push:
+    branches: [master]
+  pull_request_target:
+jobs:
+  scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Fork PRs need pull_request_target so GITLEAKS_LICENSE is available
+      # (regular pull_request from a fork has no access to repo secrets).
+      # gitleaks-action@v2 rejects pull_request_target ("event is not yet
+      # supported"), so we run the gitleaks CLI directly.
+      #
+      # Safety with pull_request_target: explicitly check out the fork's HEAD
+      # SHA, drop persisted credentials, restrict permissions to contents:read.
+      # Gitleaks only reads files — no fork code is executed.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4.2.2
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set scan range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          FORCED: ${{ github.event.forced }}
+        run: |
+          NULL_SHA="0000000000000000000000000000000000000000"
+          if [ "$EVENT" = "pull_request_target" ]; then
+            echo "log_opts=${BASE_SHA}..HEAD" >> "$GITHUB_OUTPUT"
+          elif [ "$BEFORE_SHA" = "$NULL_SHA" ] || [ -z "$BEFORE_SHA" ] || [ "$FORCED" = "true" ]; then
+            echo "log_opts=" >> "$GITHUB_OUTPUT"
+          else
+            echo "log_opts=${BEFORE_SHA}..HEAD" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install gitleaks
+        env:
+          # renovate: datasource=github-releases depName=gitleaks/gitleaks
+          GITLEAKS_VERSION: v8.30.1
+        run: |
+          VERSION="${GITLEAKS_VERSION#v}"
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      # A malicious PR could weaken/replace .gitleaks.toml in its own tree to
+      # bypass the scan. For pull_request_target, always take the config from
+      # the BASE branch (trusted), never from the checked-out fork HEAD.
+      - name: Resolve trusted gitleaks config
+        id: config
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          CONFIG_FILE=".gitleaks.toml"
+          if [ -n "$BASE_REF" ]; then
+            git fetch --quiet --depth 1 origin "$BASE_REF"
+            if git show FETCH_HEAD:.gitleaks.toml > /tmp/base-gitleaks.toml 2>/dev/null; then
+              CONFIG_FILE=/tmp/base-gitleaks.toml
+            else
+              echo "::warning::could not read .gitleaks.toml from base branch '$BASE_REF' — falling back to repo config"
+            fi
+          fi
+          if [ ! -f "$CONFIG_FILE" ]; then
+            CONFIG_FILE=""
+          fi
+          echo "config_file=$CONFIG_FILE" >> "$GITHUB_OUTPUT"
+      - name: Run gitleaks
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          LOG_OPTS: ${{ steps.range.outputs.log_opts }}
+          CONFIG_FILE: ${{ steps.config.outputs.config_file }}
+        run: |
+          CONFIG_ARGS=()
+          if [ -n "$CONFIG_FILE" ]; then
+            CONFIG_ARGS=(--config "$CONFIG_FILE")
+          fi
+          if [ -n "$LOG_OPTS" ]; then
+            gitleaks detect --source . "${CONFIG_ARGS[@]}" --log-opts "$LOG_OPTS" --exit-code 1
+          else
+            gitleaks detect --source . "${CONFIG_ARGS[@]}" --exit-code 1
+          fi

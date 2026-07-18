@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+node_modules/
+apps/vulscan-cli/bin/
+apps/vulscan-cli/vulscan.exe
+tools/gitleaks/
+libs/vulscan-core/parsers/go/go_parser/go_parser
+libs/vulscan-core/parsers/go/go_parser/go_parser.exe
+libs/vulscan-core/parsers/javascript/.911vulscan-npm-install.lock
+_docs/
+docs/
+.worktrees/
+911VulScan_Scan_Results/
+.vulscan/

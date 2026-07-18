@@ -1,0 +1,1301 @@
+#!/usr/bin/env python3
+"""
+Parser Pipeline Test Script
+
+Tests the parser pipeline components:
+1. RepositoryScanner - Enumerates source files
+2. TypeScriptAnalyzer - Extracts functions with unit type classification
+3. UnitGenerator - Creates 911VulScan dataset format
+4. CodeQL (optional) - Static analysis pre-filter
+5. ContextEnhancer (optional) - LLM enhancement using Claude Sonnet
+
+Usage:
+    python test_pipeline.py <repo_path> [--output <dir>] [--llm] [--agentic] [--processing-level LEVEL]
+
+Processing Levels (cumulative filtering):
+    Level 1: all         - Process all units (no filtering)
+    Level 2: reachable   - Process only units reachable from entry points
+    Level 3: codeql      - Process only reachable + CodeQL-flagged units
+    Level 4: exploitable - Process only reachable + CodeQL-flagged + exploitable units
+
+Example:
+    # Static analysis only
+    python test_pipeline.py /path/to/repo --output /tmp/output
+
+    # With agentic LLM enhancement
+    python test_pipeline.py /path/to/repo --output /tmp/output --llm --agentic
+
+    # CodeQL pre-filter + agentic classification
+    python test_pipeline.py /path/to/repo --output /tmp/output --llm --agentic --processing-level codeql
+
+    # Maximum cost savings: only exploitable units
+    python test_pipeline.py /path/to/repo --output /tmp/output --llm --agentic --processing-level exploitable
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Set, Tuple
+
+# Add parent directories to path so utilities can be found when run as a subprocess
+_parser_dir = Path(__file__).parent
+_core_root = _parser_dir.parent.parent
+if str(_core_root) not in sys.path:
+    sys.path.insert(0, str(_core_root))
+
+from utilities.file_io import open_utf8, read_json, run_utf8, write_json
+
+
+def _stdout_supports_unicode() -> bool:
+    """Return True if sys.stdout can emit the symbols we use for status.
+
+    Returns False when stdout is piped or redirected (common in CI) and
+    the encoding cannot be determined — this degrades output to plain ASCII
+    rather than raising UnicodeEncodeError at runtime.
+    """
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return False
+    try:
+        # Probe with the actual symbols we emit. This catches cp1252 and
+        # other limited code pages without us having to enumerate them.
+        "✓✗→".encode(encoding)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+_UNICODE_OK = _stdout_supports_unicode()
+SYM_OK = "✓" if _UNICODE_OK else "OK"
+SYM_FAIL = "✗" if _UNICODE_OK else "FAIL"
+SYM_ARROW = "→" if _UNICODE_OK else "->"
+
+# Add parent directory to path for utilities import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from utilities.context_enhancer import ContextEnhancer
+from core.parser_adapter import apply_reachability_filter as _canonical_reachability_filter
+
+
+class ProcessingLevel(Enum):
+    """
+    Processing level determines which units are processed.
+    Levels are cumulative - each level includes filters from previous levels.
+    """
+    ALL = "all"                    # Level 1: Process all units (no filtering)
+    REACHABLE = "reachable"        # Level 2: Filter to reachable from entry points
+    CODEQL = "codeql"              # Level 3: Filter to reachable + CodeQL-flagged
+    EXPLOITABLE = "exploitable"    # Level 4: Filter to reachable + CodeQL-flagged + exploitable
+
+
+class PipelineTest:
+    def __init__(
+        self,
+        repo_path: str,
+        output_dir: str = None,
+        enable_llm: bool = False,
+        agentic: bool = False,
+        analyzer_path: str = None,
+        processing_level: ProcessingLevel = ProcessingLevel.ALL,
+        skip_tests: bool = False,
+        depth: int = 3,
+        name: str = None
+    ):
+        self.repo_path = os.path.abspath(repo_path)
+        self.output_dir = output_dir or os.path.join(os.path.dirname(__file__), 'test_output')
+        self.parser_dir = os.path.dirname(os.path.abspath(__file__))
+        self.enable_llm = enable_llm
+        self.agentic = agentic
+        self.processing_level = processing_level
+        self.skip_tests = skip_tests
+        self.depth = depth
+        self.dataset_name = name
+
+        # Component locations
+        # repository_scanner.js and unit_generator.js are in this package
+        self.repository_scanner = os.path.join(self.parser_dir, 'repository_scanner.js')
+        self.typescript_analyzer = analyzer_path  # Must be provided
+        self.unit_generator = os.path.join(self.parser_dir, 'unit_generator.js')
+
+        # Pipeline artifacts
+        self.scan_results_file = None
+        self.analyzer_output_file = None
+        self.dataset_file = None
+
+        # Reachability data (populated if processing_level >= REACHABLE)
+        self.entry_points: Set[str] = set()
+        self.reachable_units: Set[str] = set()
+
+        # CodeQL data (populated if processing_level >= CODEQL)
+        self.codeql_flagged_units: Set[str] = set()
+        self.codeql_findings: list = []
+
+        # Results
+        self.results = {
+            'repository': self.repo_path,
+            'test_time': datetime.now().isoformat(),
+            'processing_level': processing_level.value,
+            'stages': {}
+        }
+
+    def setup(self):
+        """Create output directory if needed."""
+        os.makedirs(self.output_dir, exist_ok=True)
+        print(f"Output directory: {self.output_dir}")
+        print()
+
+    def run_stage(self, name: str, command: list, output_file: str) -> dict:
+        """Run a pipeline stage and capture results."""
+        print(f"=" * 60)
+        print(f"STAGE: {name}")
+        print(f"=" * 60)
+        print(f"Command: {' '.join(command)}")
+        print()
+
+        start_time = datetime.now()
+
+        try:
+            result = run_utf8(
+                command,
+                capture_output=True,
+                text=True,
+                cwd=self.parser_dir,
+                timeout=1800  # 30 minute timeout
+            )
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            stage_result = {
+                'success': result.returncode == 0,
+                'elapsed_seconds': elapsed,
+                'output_file': output_file if result.returncode == 0 else None,
+                'stdout': result.stdout,
+                'stderr': result.stderr
+            }
+
+            if result.returncode == 0:
+                print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+                print()
+                # Print stderr (often contains summary info)
+                if result.stderr:
+                    for line in result.stderr.strip().split('\n'):
+                        print(f"  {line}")
+                print()
+
+                # Load and summarize output
+                if os.path.exists(output_file):
+                    data = read_json(output_file)
+                    stage_result['summary'] = self._summarize_output(name, data)
+            else:
+                print(f"{SYM_FAIL} Failed (exit code {result.returncode})")
+                print()
+                if result.stderr:
+                    print("STDERR:")
+                    print(result.stderr)
+                if result.stdout:
+                    print("STDOUT:")
+                    print(result.stdout)
+
+            return stage_result
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            return {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': str(e)
+            }
+
+    def _summarize_output(self, stage: str, data: dict) -> dict:
+        """Extract summary statistics from stage output."""
+        if stage == 'repository_scanner':
+            stats = data.get('statistics', {})
+            return {
+                'total_files': stats.get('totalFiles', 0),
+                'by_extension': stats.get('byExtension', {}),
+                'total_size_bytes': stats.get('totalSizeBytes', 0)
+            }
+        elif stage == 'typescript_analyzer':
+            functions = data.get('functions', {})
+            call_graph = data.get('callGraph', {})
+
+            # Count by unit type
+            by_type = {}
+            for func in functions.values():
+                unit_type = func.get('unitType', 'unknown')
+                by_type[unit_type] = by_type.get(unit_type, 0) + 1
+
+            return {
+                'total_functions': len(functions),
+                'by_unit_type': by_type,
+                'call_graph_entries': len(call_graph)
+            }
+        elif stage == 'unit_generator':
+            stats = data.get('statistics', {})
+            call_graph_stats = stats.get('callGraph', {})
+
+            # Count units with dependencies
+            units = data.get('units', [])
+            units_with_deps = sum(1 for u in units if len(u.get('code', {}).get('dependencies', [])) > 0)
+
+            return {
+                'total_units': stats.get('totalUnits', 0),
+                'by_type': stats.get('byType', {}),
+                'units_with_dependencies': units_with_deps,
+                'call_graph_edges': call_graph_stats.get('totalEdges', 0),
+                'avg_out_degree': call_graph_stats.get('avgOutDegree', 0)
+            }
+        return {}
+
+    def run_repository_scanner(self) -> bool:
+        """Stage 1: Scan repository for source files."""
+        self.scan_results_file = os.path.join(self.output_dir, 'scan_results.json')
+
+        command = ['node', self.repository_scanner, self.repo_path, '--output', self.scan_results_file]
+        if self.skip_tests:
+            command.append('--skip-tests')
+
+        result = self.run_stage(
+            'repository_scanner',
+            command,
+            self.scan_results_file
+        )
+
+        self.results['stages']['repository_scanner'] = result
+        return result.get('success', False)
+
+    def run_typescript_analyzer(self, files: list = None) -> bool:
+        """Stage 2: Analyze files with TypeScript analyzer."""
+        self.analyzer_output_file = os.path.join(self.output_dir, 'analyzer_output.json')
+
+        # If no specific files, use ALL files from scan results
+        if not files and self.scan_results_file and os.path.exists(self.scan_results_file):
+            scan_data = read_json(self.scan_results_file)
+            files = [f['path'] for f in scan_data.get('files', [])]
+
+        if not files:
+            print("No files to analyze")
+            return False
+
+        # Write file list to a temporary file to avoid command-line length limits
+        file_list_path = os.path.join(self.output_dir, 'file_list.txt')
+        with open_utf8(file_list_path, 'w') as f:
+            for file_path in files:
+                # Convert relative path to absolute
+                if not os.path.isabs(file_path):
+                    file_path = os.path.join(self.repo_path, file_path)
+                f.write(file_path + '\n')
+
+        print(f"  Written {len(files)} file paths to {file_list_path}")
+
+        # Build command using --files-from and --output options
+        # This writes directly to file, avoiding stdout buffer limits
+        command = [
+            'node', self.typescript_analyzer, self.repo_path,
+            '--files-from', file_list_path,
+            '--output', self.analyzer_output_file
+        ]
+
+        result = self.run_stage(
+            'typescript_analyzer',
+            command,
+            self.analyzer_output_file
+        )
+
+        self.results['stages']['typescript_analyzer'] = result
+
+        # Write call_graph.json immediately after the analyzer output is
+        # available so the post-LLM reachability re-filter can use it
+        # regardless of processing_level (which may be "all").
+        if result.get('success', False) and os.path.exists(self.analyzer_output_file):
+            try:
+                analyzer = read_json(self.analyzer_output_file)
+                call_graph_data = {
+                    "functions": analyzer.get("functions", {}),
+                    "call_graph": analyzer.get("call_graph", analyzer.get("callGraph", {})),
+                    "reverse_call_graph": analyzer.get("reverse_call_graph", analyzer.get("reverseCallGraph", {})),
+                }
+                call_graph_file = os.path.join(self.output_dir, 'call_graph.json')
+                write_json(call_graph_file, call_graph_data)
+            except (OSError, json.JSONDecodeError, KeyError) as e:
+                print(f"Warning: could not write call_graph.json: {e}")
+
+        return result.get('success', False)
+
+    def run_stage_with_stdout_capture(self, name: str, command: list, output_file: str) -> dict:
+        """Run a stage that outputs JSON to stdout, capturing to a file."""
+        print(f"=" * 60)
+        print(f"STAGE: {name}")
+        print(f"=" * 60)
+        print(f"Command: {' '.join(command)}")
+        print()
+
+        start_time = datetime.now()
+
+        try:
+            result = run_utf8(
+                command,
+                capture_output=True,
+                text=True,
+                cwd=self.parser_dir,
+                timeout=1800  # 30 minute timeout
+            )
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            if result.returncode == 0:
+                # Write stdout to output file
+                with open_utf8(output_file, 'w') as f:
+                    f.write(result.stdout)
+
+                print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+                print()
+                # Print stderr (often contains summary info)
+                if result.stderr:
+                    for line in result.stderr.strip().split('\n'):
+                        print(f"  {line}")
+                print()
+
+                # Load and summarize output
+                if os.path.exists(output_file):
+                    data = read_json(output_file)
+                    summary = self._summarize_output(name, data)
+                else:
+                    summary = {}
+
+                return {
+                    'success': True,
+                    'elapsed_seconds': elapsed,
+                    'output_file': output_file,
+                    'summary': summary,
+                    'stderr': result.stderr
+                }
+            else:
+                print(f"{SYM_FAIL} Failed (exit code {result.returncode})")
+                print()
+                if result.stderr:
+                    print("STDERR:")
+                    print(result.stderr)
+                if result.stdout:
+                    print("STDOUT:")
+                    print(result.stdout[:500])  # Truncate for display
+
+                return {
+                    'success': False,
+                    'elapsed_seconds': elapsed,
+                    'stdout': result.stdout,
+                    'stderr': result.stderr
+                }
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            return {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': str(e)
+            }
+
+    def run_unit_generator(self) -> bool:
+        """Stage 3: Generate dataset units."""
+        if not self.analyzer_output_file or not os.path.exists(self.analyzer_output_file):
+            print("No analyzer output to process")
+            return False
+
+        self.dataset_file = os.path.join(self.output_dir, 'dataset.json')
+
+        command = ['node', self.unit_generator, self.analyzer_output_file, '--output', self.dataset_file]
+        if self.depth != 3:
+            command.extend(['--depth', str(self.depth)])
+        if self.dataset_name:
+            command.extend(['--name', self.dataset_name])
+
+        result = self.run_stage(
+            'unit_generator',
+            command,
+            self.dataset_file
+        )
+
+        self.results['stages']['unit_generator'] = result
+
+        # Finalize unified call_graph.json after dependency resolution.
+        call_graph_file = os.path.join(self.output_dir, 'call_graph.json')
+        if result.get('success', False) and os.path.exists(call_graph_file):
+            try:
+                from utilities.call_graph.schema import write_call_graph
+                write_call_graph(
+                    call_graph_file, read_json(call_graph_file), language='javascript'
+                )
+            except Exception as e:
+                print(f"Warning: could not finalize call_graph.json: {e}")
+
+        return result.get('success', False)
+
+    def run_context_enhancer(self) -> bool:
+        """Stage 4 (optional): Enhance dataset with LLM context."""
+        if not self.dataset_file or not os.path.exists(self.dataset_file):
+            print("No dataset to enhance")
+            return False
+
+        mode = "agentic" if self.agentic else "single-shot"
+        print("=" * 60)
+        print(f"STAGE: context_enhancer (Python, {mode} mode)")
+        print("=" * 60)
+        print()
+
+        start_time = datetime.now()
+
+        try:
+            # Load dataset
+            dataset = read_json(self.dataset_file)
+
+            # Enhance with LLM
+            enhancer = ContextEnhancer()
+
+            if self.agentic:
+                # Agentic mode - iterative tool use
+                # Use checkpoint file for crash recovery
+                checkpoint_path = self.dataset_file.replace('.json', '_checkpoint.json')
+                enhanced = enhancer.enhance_dataset_agentic(
+                    dataset,
+                    analyzer_output_path=self.analyzer_output_file,
+                    repo_path=self.repo_path,
+                    batch_size=5,
+                    verbose=False,
+                    checkpoint_path=checkpoint_path
+                )
+                # Get agentic stats for summary
+                agentic_stats = enhanced.get('metadata', {}).get('agentic_stats', {})
+                summary = {
+                    'mode': 'agentic',
+                    'units_processed': agentic_stats.get('units_processed', 0),
+                    'units_with_context': agentic_stats.get('units_with_context', 0),
+                    'functions_added': agentic_stats.get('functions_added', 0),
+                    'security_controls_found': agentic_stats.get('security_controls_found', 0),
+                    'vulnerable_found': agentic_stats.get('vulnerable_found', 0),
+                    'neutral_found': agentic_stats.get('neutral_found', 0)
+                }
+            else:
+                # Single-shot mode (default)
+                enhanced = enhancer.enhance_dataset(dataset)
+                summary = {
+                    'mode': 'single-shot',
+                    'units_enhanced': enhancer.stats['units_enhanced'],
+                    'dependencies_added': enhancer.stats['dependencies_added'],
+                    'callers_added': enhancer.stats['callers_added'],
+                    'data_flows_extracted': enhancer.stats['data_flows_extracted']
+                }
+
+            # Write back
+            write_json(self.dataset_file, enhanced)
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            result = {
+                'success': True,
+                'elapsed_seconds': elapsed,
+                'output_file': self.dataset_file,
+                'summary': summary
+            }
+
+            print()
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+
+            self.results['stages']['context_enhancer'] = result
+            return True
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            import traceback
+            traceback.print_exc()
+            result = {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': str(e)
+            }
+            self.results['stages']['context_enhancer'] = result
+            return False
+
+    def apply_reachability_filter(self) -> bool:
+        """
+        Filter dataset to only include units reachable from entry points.
+
+        This is Stage 3.5 - applied after UnitGenerator if processing_level >= REACHABLE.
+        Uses static analysis to identify entry points and trace reachability via call graph.
+
+        Returns:
+            True if filtering succeeded, False otherwise
+        """
+        if not self.analyzer_output_file or not os.path.exists(self.analyzer_output_file):
+            print("No analyzer output for reachability filtering")
+            return False
+
+        if not self.dataset_file or not os.path.exists(self.dataset_file):
+            print("No dataset to filter")
+            return False
+
+        print("=" * 60)
+        print("STAGE: reachability_filter (static analysis)")
+        print("=" * 60)
+        print()
+
+        start_time = datetime.now()
+
+        try:
+            dataset = read_json(self.dataset_file)
+            level = (
+                self.processing_level.value
+                if hasattr(self.processing_level, "value")
+                else str(self.processing_level)
+            )
+            dataset = _canonical_reachability_filter(dataset, self.output_dir, level)
+            meta = dataset.get("metadata", {}).get("reachability_filter", {})
+            self.entry_points = set()
+            self.reachable_units = {
+                u.get("id")
+                for u in dataset.get("units", [])
+                if u.get("reachability") == "reachable"
+            }
+            for u in dataset.get("units", []):
+                if u.get("is_entry_point"):
+                    self.entry_points.add(u.get("id"))
+            write_json(self.dataset_file, dataset)
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+            summary = {
+                "original_units": meta.get("original_units", 0),
+                "entry_points": len(self.entry_points),
+                "reachable_units": meta.get("kept_units", len(dataset.get("units", []))),
+                "reduction_percentage": meta.get("reduction_percentage", 0),
+            }
+
+            result = {
+                "success": True,
+                "elapsed_seconds": elapsed,
+                "output_file": self.dataset_file,
+                "summary": summary,
+            }
+
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+            print(f"  Structural roots: {len(self.entry_points)}")
+            print(
+                f"  Units: {summary['original_units']} {SYM_ARROW} "
+                f"{summary['reachable_units']} ({summary['reduction_percentage']}% reduction)"
+            )
+            print()
+
+            self.results["stages"]["reachability_filter"] = result
+            return True
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            import traceback
+            traceback.print_exc()
+            result = {
+                "success": False,
+                "elapsed_seconds": elapsed,
+                "error": str(e),
+            }
+            self.results["stages"]["reachability_filter"] = result
+            return False
+
+    def _detect_codeql_language(self) -> str:
+        """
+        Detect the primary language for CodeQL analysis based on file extensions.
+
+        Returns:
+            Language string for CodeQL ('javascript' or 'python')
+        """
+        if not self.scan_results_file or not os.path.exists(self.scan_results_file):
+            return "javascript"  # Default
+
+        try:
+            scan_data = read_json(self.scan_results_file)
+
+            stats = scan_data.get('statistics', {})
+            by_extension = stats.get('byExtension', {})
+
+            # Count files by language category
+            js_count = sum(by_extension.get(ext, 0) for ext in ['.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs'])
+            py_count = sum(by_extension.get(ext, 0) for ext in ['.py', '.pyw'])
+
+            if py_count > js_count:
+                return "python"
+            return "javascript"
+
+        except Exception:
+            return "javascript"  # Default on error
+
+    def run_codeql_analysis(self) -> bool:
+        """
+        Run CodeQL analysis on the repository.
+
+        This is Stage 3.6 - runs CodeQL to identify potentially vulnerable code.
+        Creates a CodeQL database, runs security queries, and parses SARIF output.
+
+        Returns:
+            True if analysis succeeded, False otherwise
+        """
+        print("=" * 60)
+        print("STAGE: codeql_analysis")
+        print("=" * 60)
+        print()
+
+        start_time = datetime.now()
+
+        # Determine language for CodeQL based on scan results
+        language = self._detect_codeql_language()
+        print(f"Detected language: {language}")
+
+        codeql_db_path = os.path.join(self.output_dir, 'codeql-db')
+        sarif_output = os.path.join(self.output_dir, 'codeql-results.sarif')
+
+        try:
+            # Step 1: Create CodeQL database
+            print("Creating CodeQL database...")
+            create_db_cmd = [
+                'codeql', 'database', 'create',
+                codeql_db_path,
+                f'--language={language}',
+                f'--source-root={self.repo_path}',
+                '--overwrite'
+            ]
+
+            result = run_utf8(
+                create_db_cmd,
+                capture_output=True,
+                text=True,
+                timeout=600  # 10 minute timeout
+            )
+
+            if result.returncode != 0:
+                print(f"{SYM_FAIL} CodeQL database creation failed")
+                print(f"  stderr: {result.stderr[:500] if result.stderr else 'none'}")
+                elapsed = (datetime.now() - start_time).total_seconds()
+                self.results['stages']['codeql_analysis'] = {
+                    'success': False,
+                    'elapsed_seconds': elapsed,
+                    'error': 'Database creation failed',
+                    'stderr': result.stderr
+                }
+                return False
+
+            print("  Database created successfully")
+
+            # Step 2: Run security queries
+            print("Running security queries...")
+            analyze_cmd = [
+                'codeql', 'database', 'analyze',
+                codeql_db_path,
+                f'--format=sarif-latest',
+                f'--output={sarif_output}',
+                f'codeql/{language}-queries:codeql-suites/{language}-security-extended.qls'
+            ]
+
+            result = run_utf8(
+                analyze_cmd,
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minute timeout
+            )
+
+            if result.returncode != 0:
+                print(f"{SYM_FAIL} CodeQL analysis failed")
+                print(f"  stderr: {result.stderr[:500] if result.stderr else 'none'}")
+                elapsed = (datetime.now() - start_time).total_seconds()
+                self.results['stages']['codeql_analysis'] = {
+                    'success': False,
+                    'elapsed_seconds': elapsed,
+                    'error': 'Analysis failed',
+                    'stderr': result.stderr
+                }
+                return False
+
+            print("  Analysis completed")
+
+            # Step 3: Parse SARIF output
+            print("Parsing results...")
+            if not os.path.exists(sarif_output):
+                print(f"{SYM_FAIL} SARIF output not found")
+                elapsed = (datetime.now() - start_time).total_seconds()
+                self.results['stages']['codeql_analysis'] = {
+                    'success': False,
+                    'elapsed_seconds': elapsed,
+                    'error': 'SARIF output not found'
+                }
+                return False
+
+            sarif_data = read_json(sarif_output)
+
+            # Extract findings and map to file:line
+            self.codeql_findings = []
+            flagged_locations = set()
+
+            for run in sarif_data.get('runs', []):
+                for result in run.get('results', []):
+                    rule_id = result.get('ruleId', 'unknown')
+                    message = result.get('message', {}).get('text', '')
+                    level = result.get('level', 'warning')
+
+                    for location in result.get('locations', []):
+                        physical = location.get('physicalLocation', {})
+                        artifact = physical.get('artifactLocation', {})
+                        uri = artifact.get('uri', '')
+                        region = physical.get('region', {})
+                        start_line = region.get('startLine', 0)
+                        end_line = region.get('endLine', start_line)
+
+                        finding = {
+                            'rule_id': rule_id,
+                            'message': message,
+                            'level': level,
+                            'file': uri,
+                            'start_line': start_line,
+                            'end_line': end_line
+                        }
+                        self.codeql_findings.append(finding)
+                        flagged_locations.add((uri, start_line, end_line))
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            summary = {
+                'total_findings': len(self.codeql_findings),
+                'unique_files': len(set(f['file'] for f in self.codeql_findings)),
+                'by_level': {},
+                'by_rule': {}
+            }
+
+            for finding in self.codeql_findings:
+                level = finding['level']
+                rule = finding['rule_id']
+                summary['by_level'][level] = summary['by_level'].get(level, 0) + 1
+                summary['by_rule'][rule] = summary['by_rule'].get(rule, 0) + 1
+
+            result_data = {
+                'success': True,
+                'elapsed_seconds': elapsed,
+                'output_file': sarif_output,
+                'summary': summary
+            }
+
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+            print(f"  Total findings: {len(self.codeql_findings)}")
+            print(f"  Unique files: {summary['unique_files']}")
+            if summary['by_level']:
+                print(f"  By level: {summary['by_level']}")
+            print()
+
+            self.results['stages']['codeql_analysis'] = result_data
+            return True
+
+        except FileNotFoundError:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} CodeQL not found. Please install CodeQL CLI.")
+            print("  See: https://docs.github.com/en/code-security/codeql-cli")
+            self.results['stages']['codeql_analysis'] = {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': 'CodeQL CLI not installed'
+            }
+            return False
+
+        except subprocess.TimeoutExpired:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} CodeQL analysis timed out")
+            self.results['stages']['codeql_analysis'] = {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': 'Timeout'
+            }
+            return False
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.results['stages']['codeql_analysis'] = {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': str(e)
+            }
+            return False
+
+    def apply_codeql_filter(self) -> bool:
+        """
+        Filter dataset to only include units flagged by CodeQL.
+
+        This is Stage 3.7 - applied after CodeQL analysis if processing_level >= CODEQL.
+        Maps CodeQL findings (file:line) to function units based on line ranges.
+
+        Returns:
+            True if filtering succeeded, False otherwise
+        """
+        if not self.dataset_file or not os.path.exists(self.dataset_file):
+            print("No dataset to filter")
+            return False
+
+        if not self.codeql_findings:
+            print("No CodeQL findings to filter by")
+            return False
+
+        print("=" * 60)
+        print("STAGE: codeql_filter")
+        print("=" * 60)
+        print()
+
+        start_time = datetime.now()
+
+        try:
+            # Load analyzer output to get function line ranges
+            analyzer = read_json(self.analyzer_output_file)
+
+            functions = analyzer.get("functions", {})
+
+            # Build mapping of file -> [(start_line, end_line, func_id)]
+            file_functions = {}
+            for func_id, func_data in functions.items():
+                # Extract file path from func_id (format: "file/path.ts:functionName")
+                colon_idx = func_id.rfind(":")
+                if colon_idx > 0:
+                    file_path = func_id[:colon_idx]
+                    start_line = func_data.get('startLine', 0)
+                    end_line = func_data.get('endLine', start_line)
+
+                    if file_path not in file_functions:
+                        file_functions[file_path] = []
+                    file_functions[file_path].append((start_line, end_line, func_id))
+
+            # Map CodeQL findings to function units
+            for finding in self.codeql_findings:
+                file_uri = finding['file']
+                finding_start = finding['start_line']
+                finding_end = finding['end_line']
+
+                # Try to match file path (CodeQL uses relative URIs)
+                matched_file = None
+                for file_path in file_functions.keys():
+                    if file_path.endswith(file_uri) or file_uri.endswith(file_path) or file_path == file_uri:
+                        matched_file = file_path
+                        break
+
+                if matched_file:
+                    # Find functions that contain this finding
+                    for start, end, func_id in file_functions[matched_file]:
+                        if start <= finding_start <= end or start <= finding_end <= end:
+                            self.codeql_flagged_units.add(func_id)
+
+            # Load and filter dataset
+            dataset = read_json(self.dataset_file)
+
+            units = dataset.get("units", [])
+            original_count = len(units)
+
+            # Filter to CodeQL-flagged units
+            filtered_units = [u for u in units if u.get("id") in self.codeql_flagged_units]
+
+            # Update dataset
+            dataset["units"] = filtered_units
+            dataset["metadata"] = dataset.get("metadata", {})
+            dataset["metadata"]["codeql_filter"] = {
+                "original_units": original_count,
+                "codeql_findings": len(self.codeql_findings),
+                "flagged_units": len(self.codeql_flagged_units),
+                "filtered_units": len(filtered_units),
+                "filtered_out": original_count - len(filtered_units),
+                "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
+            }
+
+            # Write filtered dataset
+            write_json(self.dataset_file, dataset)
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            summary = {
+                'original_units': original_count,
+                'codeql_findings': len(self.codeql_findings),
+                'flagged_units': len(self.codeql_flagged_units),
+                'filtered_units': len(filtered_units),
+                'reduction_percentage': dataset["metadata"]["codeql_filter"]["reduction_percentage"]
+            }
+
+            result = {
+                'success': True,
+                'elapsed_seconds': elapsed,
+                'output_file': self.dataset_file,
+                'summary': summary
+            }
+
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+            print(f"  CodeQL findings: {len(self.codeql_findings)}")
+            print(f"  Flagged function units: {len(self.codeql_flagged_units)}")
+            print(f"  Units: {original_count} {SYM_ARROW} {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
+            print()
+
+            self.results['stages']['codeql_filter'] = result
+            return True
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            import traceback
+            traceback.print_exc()
+            result = {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': str(e)
+            }
+            self.results['stages']['codeql_filter'] = result
+            return False
+
+    def apply_exploitable_filter(self) -> bool:
+        """No-op: Enhance no longer emits security_classification."""
+        if not self.dataset_file or not os.path.exists(self.dataset_file):
+            print("No dataset to filter")
+            return False
+
+        print("=" * 60)
+        print("STAGE: exploitable_filter (no-op)")
+        print("=" * 60)
+        print()
+        print(
+            "Enhance is a neutral context layer; security_classification was removed. "
+            "Keeping all units from prior filters."
+        )
+        print()
+
+        start_time = datetime.now()
+
+        try:
+            dataset = read_json(self.dataset_file)
+
+            units = dataset.get("units", [])
+            original_count = len(units)
+
+            filtered_units = list(units)
+            classification_counts = {"neutral_context": len(units)}
+
+            dataset["units"] = filtered_units
+            dataset["metadata"] = dataset.get("metadata", {})
+            dataset["metadata"]["exploitable_filter"] = {
+                "original_units": original_count,
+                "exploitable_units": len(filtered_units),
+                "skipped": True,
+                "reason": "enhancement_no_longer_classifies",
+                "filtered_out": original_count - len(filtered_units),
+                "classification_counts": classification_counts,
+                "reduction_percentage": round((1 - len(filtered_units) / original_count) * 100, 1) if original_count > 0 else 0
+            }
+
+            # Write filtered dataset
+            write_json(self.dataset_file, dataset)
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            summary = {
+                'original_units': original_count,
+                'exploitable_units': len(filtered_units),
+                'classification_counts': classification_counts,
+                'reduction_percentage': dataset["metadata"]["exploitable_filter"]["reduction_percentage"]
+            }
+
+            result = {
+                'success': True,
+                'elapsed_seconds': elapsed,
+                'output_file': self.dataset_file,
+                'summary': summary
+            }
+
+            print(f"{SYM_OK} Success ({elapsed:.2f}s)")
+            print(f"  Classification breakdown:")
+            for cls, count in sorted(classification_counts.items()):
+                marker = SYM_ARROW if cls == "exploitable" else " "
+                print(f"    {marker} {cls}: {count}")
+            print(f"  Units: {original_count} {SYM_ARROW} {len(filtered_units)} ({summary['reduction_percentage']}% reduction)")
+            print()
+
+            self.results['stages']['exploitable_filter'] = result
+            return True
+
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            print(f"{SYM_FAIL} Error: {e}")
+            import traceback
+            traceback.print_exc()
+            result = {
+                'success': False,
+                'elapsed_seconds': elapsed,
+                'error': str(e)
+            }
+            self.results['stages']['exploitable_filter'] = result
+            return False
+
+    def run_full_pipeline(self):
+        """Run the complete pipeline."""
+        print("=" * 60)
+        print("PARSER PIPELINE TEST")
+        print("=" * 60)
+        print(f"Repository: {self.repo_path}")
+        print(f"Processing Level: {self.processing_level.value}")
+        print(f"Started: {self.results['test_time']}")
+        print()
+
+        self.setup()
+
+        # Stage 1: Repository Scanner
+        if not self.run_repository_scanner():
+            print("Pipeline stopped: Repository scanner failed")
+            return self.results
+
+        # Stage 2: TypeScript Analyzer
+        if not self.run_typescript_analyzer():
+            print("Pipeline stopped: TypeScript analyzer failed")
+            return self.results
+
+        # Stage 3: Unit Generator
+        if not self.run_unit_generator():
+            print("Pipeline stopped: Unit generator failed")
+            return self.results
+
+        # Stage 3.5 (optional): Reachability Filter
+        # Applied if processing_level >= REACHABLE
+        if self.processing_level in (ProcessingLevel.REACHABLE, ProcessingLevel.CODEQL, ProcessingLevel.EXPLOITABLE):
+            if not self.apply_reachability_filter():
+                print("Warning: Reachability filter failed, continuing with all units")
+
+        # Stage 3.6-3.7 (optional): CodeQL Analysis and Filter
+        # Applied if processing_level >= CODEQL
+        if self.processing_level in (ProcessingLevel.CODEQL, ProcessingLevel.EXPLOITABLE):
+            codeql_success = self.run_codeql_analysis()
+            if codeql_success:
+                if not self.apply_codeql_filter():
+                    print("Warning: CodeQL filter failed, continuing with reachable units")
+            else:
+                print("Warning: CodeQL analysis failed, continuing with reachable units only")
+
+        # Stage 4 (optional): Context Enhancer
+        if self.enable_llm:
+            if not self.run_context_enhancer():
+                print("Warning: Context enhancer failed, continuing with static analysis only")
+
+            # Stage 4.5 (optional): Exploitable Filter
+            # Applied only if processing_level is EXPLOITABLE and agentic mode was used
+            if self.processing_level == ProcessingLevel.EXPLOITABLE and self.agentic:
+                if not self.apply_exploitable_filter():
+                    print("Warning: Exploitable filter failed")
+
+        # Summary
+        print("=" * 60)
+        print("PIPELINE SUMMARY")
+        print("=" * 60)
+
+        all_success = all(
+            stage.get('success', False)
+            for stage in self.results['stages'].values()
+        )
+
+        self.results['success'] = all_success
+
+        if all_success:
+            print(f"{SYM_OK} All stages completed successfully")
+        else:
+            print(f"{SYM_FAIL} Some stages failed")
+
+        print()
+        for stage_name, stage_result in self.results['stages'].items():
+            status = SYM_OK if stage_result.get('success') else SYM_FAIL
+            elapsed = stage_result.get('elapsed_seconds', 0)
+            print(f"  {status} {stage_name}: {elapsed:.2f}s")
+
+            if 'summary' in stage_result:
+                summary = stage_result['summary']
+                if 'total_files' in summary:
+                    print(f"      Files: {summary['total_files']}")
+                if 'total_functions' in summary:
+                    print(f"      Functions: {summary['total_functions']}")
+                    if 'by_unit_type' in summary:
+                        for ut, count in summary['by_unit_type'].items():
+                            print(f"        - {ut}: {count}")
+                if 'total_units' in summary:
+                    print(f"      Units: {summary['total_units']}")
+                    if 'units_with_dependencies' in summary:
+                        deps = summary['units_with_dependencies']
+                        edges = summary.get('call_graph_edges', 0)
+                        avg_deg = summary.get('avg_out_degree', 0)
+                        print(f"      Units with dependencies: {deps}")
+                        print(f"      Call graph: {edges} edges, avg degree: {avg_deg}")
+                if 'units_enhanced' in summary:
+                    print(f"      Units enhanced: {summary['units_enhanced']}")
+                    print(f"      Dependencies added: {summary.get('dependencies_added', 0)}")
+                    print(f"      Callers added: {summary.get('callers_added', 0)}")
+                    print(f"      Data flows extracted: {summary.get('data_flows_extracted', 0)}")
+
+        print()
+        print(f"Output files in: {self.output_dir}")
+
+        # Save results summary
+        results_file = os.path.join(self.output_dir, 'pipeline_results.json')
+        with open_utf8(results_file, 'w') as f:
+            # Remove stdout/stderr from saved results (too verbose)
+            clean_results = {
+                'repository': self.results['repository'],
+                'test_time': self.results['test_time'],
+                'processing_level': self.results.get('processing_level', 'all'),
+                'success': self.results.get('success', False),
+                'stages': {}
+            }
+            for stage_name, stage_result in self.results['stages'].items():
+                clean_results['stages'][stage_name] = {
+                    'success': stage_result.get('success', False),
+                    'elapsed_seconds': stage_result.get('elapsed_seconds', 0),
+                    'output_file': stage_result.get('output_file'),
+                    'summary': stage_result.get('summary', {})
+                }
+            json.dump(clean_results, f, indent=2)
+
+        print(f"Results summary: {results_file}")
+
+        return self.results
+
+
+def main():
+    # ========================================
+    # HARDCODED ARGUMENTS FOR IDE EXECUTION
+    # Set these values to run directly from IDE
+    # ========================================
+    IDE_MODE = False  # Set to True to use hardcoded values below
+    HARDCODED_REPO_PATH = os.path.expanduser('~/code/test_repos/Flowise/packages/components')
+    HARDCODED_OUTPUT_DIR = os.path.expanduser('~/code/vulscan/datasets/flowise')
+    HARDCODED_ANALYZER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'typescript_analyzer.js')
+    HARDCODED_ENABLE_LLM = True
+    HARDCODED_AGENTIC = True
+    HARDCODED_PROCESSING_LEVEL = ProcessingLevel.EXPLOITABLE  # all, reachable, codeql, or exploitable
+    # ========================================
+
+    if IDE_MODE:
+        repo_path = HARDCODED_REPO_PATH
+        output_dir = HARDCODED_OUTPUT_DIR
+        analyzer_path = HARDCODED_ANALYZER_PATH
+        enable_llm = HARDCODED_ENABLE_LLM
+        agentic = HARDCODED_AGENTIC
+        processing_level = HARDCODED_PROCESSING_LEVEL
+        skip_tests = False
+        depth = 3
+        name = None
+    else:
+        parser = argparse.ArgumentParser(
+            description='Test the parser pipeline on a repository',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Processing Levels (cumulative filtering):
+  all         Level 1: Process all units (no filtering, highest cost)
+  reachable   Level 2: Filter to units reachable from entry points
+  codeql      Level 3: Filter to reachable + CodeQL-flagged units (requires CodeQL CLI)
+  exploitable Level 4: Filter to reachable + CodeQL-flagged + exploitable (requires --llm --agentic)
+
+Examples:
+  # Static analysis only (all units)
+  python test_pipeline.py /path/to/repo
+
+  # With reachability filtering only
+  python test_pipeline.py /path/to/repo --processing-level reachable
+
+  # With CodeQL pre-filter + agentic classification
+  python test_pipeline.py /path/to/repo --llm --agentic --processing-level codeql
+
+  # Maximum cost savings: only exploitable units
+  python test_pipeline.py /path/to/repo --llm --agentic --processing-level exploitable
+"""
+        )
+        parser.add_argument(
+            'repo_path',
+            help='Path to the repository to analyze'
+        )
+        parser.add_argument(
+            '--output', '-o',
+            help='Output directory for pipeline artifacts',
+            default=None
+        )
+        parser.add_argument(
+            '--analyzer-path',
+            default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'typescript_analyzer.js'),
+            help='Path to typescript_analyzer.js (default: co-located file)'
+        )
+        parser.add_argument(
+            '--llm',
+            action='store_true',
+            help='Enable LLM context enhancement (uses Claude Sonnet)'
+        )
+        parser.add_argument(
+            '--agentic',
+            action='store_true',
+            help='Use agentic mode with iterative tool use (more accurate, more expensive)'
+        )
+        parser.add_argument(
+            '--processing-level',
+            choices=['all', 'reachable', 'codeql', 'exploitable'],
+            default='all',
+            help='Processing level: all (L1), reachable (L2), codeql (L3), exploitable (L4)'
+        )
+        parser.add_argument(
+            '--skip-tests',
+            action='store_true',
+            help='Skip test files'
+        )
+        parser.add_argument(
+            '--depth', '-d',
+            type=int,
+            default=3,
+            help='Max dependency resolution depth (default: 3)'
+        )
+        parser.add_argument(
+            '--name', '-n',
+            default=None,
+            help='Dataset name (default: derived from repo path)'
+        )
+
+        args = parser.parse_args()
+        repo_path = args.repo_path
+        output_dir = args.output
+        analyzer_path = args.analyzer_path
+        enable_llm = args.llm
+        agentic = args.agentic
+        processing_level = ProcessingLevel(args.processing_level)
+        skip_tests = args.skip_tests
+        depth = args.depth
+        name = args.name
+
+    if not os.path.exists(repo_path):
+        print(f"Error: Repository not found: {repo_path}")
+        sys.exit(1)
+
+    if not os.path.exists(analyzer_path):
+        print(f"Error: TypeScript analyzer not found: {analyzer_path}")
+        sys.exit(1)
+
+    # Validate processing level requirements
+    pipeline = PipelineTest(
+        repo_path,
+        output_dir,
+        enable_llm=enable_llm,
+        agentic=agentic,
+        analyzer_path=analyzer_path,
+        processing_level=processing_level,
+        skip_tests=skip_tests,
+        depth=depth,
+        name=name
+    )
+    results = pipeline.run_full_pipeline()
+
+    sys.exit(0 if results.get('success', False) else 1)
+
+
+if __name__ == '__main__':
+    main()

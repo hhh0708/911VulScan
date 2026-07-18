@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "status": "completed",
+  "run_id": "run-phase12-fixture",
+  "stage": "scan",
+  "data": {
+    "output_dir": "/tmp/vulscan/runs/run-phase12-fixture"
+  },
+  "metrics": {
+    "total_units": 10,
+    "stage2_confirmed": 1,
+    "dynamic_reproduced": 0
+  },
+  "artifacts": [
+    {
+      "kind": "pipeline_output",
+      "path": "/tmp/vulscan/runs/run-phase12-fixture/pipeline_output.json"
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}

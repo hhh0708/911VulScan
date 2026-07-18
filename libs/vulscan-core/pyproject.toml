@@ -1,0 +1,52 @@
+[project]
+name = "vulscan"
+version = "0.1.0"
+description = "Two-stage SAST tool using Claude for vulnerability analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.40.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.24.0",
+    "PyYAML>=6.0",
+    "requests>=2.32.0",
+    "tree-sitter>=0.21.0",
+    "tree-sitter-c>=0.21.0",
+    "tree-sitter-cpp>=0.21.0",
+    "tree-sitter-ruby>=0.21.0",
+    "tree-sitter-php>=0.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+vulscan = "vulscan.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Only rules that catch actual bugs (will break at runtime)
+# F821: undefined name, F811: redefined unused name, F823: local var referenced before assignment
+select = ["F821", "F811", "F823"]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "vulscan",
+    "core",
+    "utilities",
+    "parsers",
+    "prompts",
+    "context",
+    "report",
+]

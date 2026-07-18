@@ -1,0 +1,80 @@
+{
+  "parse": {
+    "dataset_path": null,
+    "analyzer_output_path": null,
+    "units_count": null,
+    "language": null,
+    "scope": null
+  },
+  "enhance": {
+    "enhanced_dataset_path": null,
+    "units_enhanced": null,
+    "error_count": null,
+    "usage": null
+  },
+  "analyze": {
+    "results_path": null,
+    "metrics": null,
+    "usage": null
+  },
+  "verify": {
+    "verified_results_path": null,
+    "candidates_input": null,
+    "attempted": null,
+    "succeeded": null,
+    "failed": null,
+    "skipped": null,
+    "confirmed": null,
+    "rejected": null,
+    "inconclusive": null,
+    "verified_unit_ids": null,
+    "usage": null
+  },
+  "dynamic-test": {
+    "results_json_path": null,
+    "results_md_path": null,
+    "candidates_input": null,
+    "attempted": null,
+    "succeeded": null,
+    "failed": null,
+    "blocked": null,
+    "skipped": null,
+    "reproduced": null,
+    "not_reproduced": null,
+    "inconclusive": null,
+    "usage": null
+  },
+  "build-output": {
+    "pipeline_output_path": null,
+    "findings_count": null
+  },
+  "report": {
+    "output_path": null,
+    "format": null,
+    "usage": null
+  },
+  "scan": {
+    "output_dir": null,
+    "run_id": null,
+    "output_root": null,
+    "dataset_path": null,
+    "enhanced_dataset_path": null,
+    "analyzer_output_path": null,
+    "app_context_path": null,
+    "results_path": null,
+    "verified_results_path": null,
+    "pipeline_output_path": null,
+    "report_path": null,
+    "summary_path": null,
+    "dynamic_test_path": null,
+    "units_count": null,
+    "language": null,
+    "metrics": null,
+    "usage": null,
+    "step_reports": null,
+    "skipped_steps": null,
+    "status": null,
+    "warnings": null,
+    "errors": null
+  }
+}

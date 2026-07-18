@@ -1,0 +1,90 @@
+Generate a security analysis summary report from the provided pipeline data.
+
+INPUT DATA:
+{pipeline_data}
+
+OUTPUT FORMAT:
+
+# {repository_name} Security Analysis
+
+**Repository:** {url}
+**Language:** {repository.language}
+**Commit:** {repository.commit_sha or "Not available"}
+**Scan Mode:** {scan_mode_line}
+**Analysis Date:** {date}
+**Application Type:** {app_type}
+**Processing Level:** {pipeline_stats.processing_level or "Not available"}
+
+## Results
+
+| Verdict | Count |
+|---------|-------|
+| Vulnerable (dynamic-test eligible) | {n} |
+| Safe | {n} |
+| Protected | {n} |
+| Inconclusive | {n} |
+| Error | {n} |
+
+[The server replaces this section with counts from pipeline data. Use results.dynamic_test_eligible for the vulnerable count.]
+
+## Pipeline Statistics
+
+- Parsed: {n} functions from {n} files
+- Total units: {pipeline_stats.total_units}
+- Reachable units: {pipeline_stats.reachable_units}
+- After CodeQL filter: {n} units
+- Analyzed in Stage 1: {n} units
+- Dynamic-test eligible findings: {pipeline_stats.dynamic_test_eligible or results.dynamic_test_eligible}
+
+## Per-Step Costs
+
+[Build from pipeline_stats.costs. Each key is a step name, with estimated, actual, units_requested, units_processed.]
+
+| Step | Estimated (USD) | Actual (USD) | Units |
+|------|-----------------|--------------|-------|
+| {step} | ${estimated} | ${actual} | {units_processed}/{units_requested} |
+| **Total** | **${sum_estimated}** | **${sum_actual}** | |
+
+## Per-Step Durations
+
+[Build from pipeline_stats.durations. Each key is a step name, value is seconds. Format as Xm Ys.]
+
+| Step | Duration |
+|------|----------|
+| {step} | {formatted_duration} |
+| **Total** | **{formatted_total}** |
+
+## Skipped Steps
+
+[Build from pipeline_stats.skipped_steps. Each entry has step and reason.]
+[If no steps were skipped, write: "No steps were skipped."]
+
+| Step | Reason |
+|------|--------|
+| {step} | {reason} |
+
+[STOP HERE — do not add any sections after Skipped Steps. Confirmed Vulnerabilities, False Positives, and Methodology are appended automatically by the server from pipeline data.]
+
+---
+
+INSTRUCTIONS:
+- Fill in all {placeholders} from the input data
+- If a count is zero, still show "0" in the table
+- Keep "Reason" column under 15 words
+- "Verified" column: "dynamic" if dynamic_testing exists for that finding, "verified" if stage2_verdict is "confirmed" or "agreed" (Stage 2 attacker simulation passed), else "static"
+- Language comes from repository.language
+- Commit SHA comes from repository.commit_sha; if null or missing, write "Not available"
+- Scan Mode is derived from the top-level `diff` field on the input data:
+  - If `diff` is missing or `diff.mode != "incremental"`, write: `Full`
+  - If `diff.mode == "incremental"`, write:
+    `Incremental ({diff.base_sha[:8]}..{diff.head_sha[:8]}, scope={diff.scope}, {diff.units_in_diff}/{diff.units_total_parsed} units)`
+  - When the scan was incremental, ALSO add a paragraph immediately after the metadata block:
+    `> This is an incremental scan. Only the {diff.units_in_diff}/{diff.units_total_parsed} unit(s) overlapping changes between {diff.base_sha[:8]} and {diff.head_sha[:8]} were analyzed. Findings on unchanged units inherit the most recent prior verdict and are not re-examined here.`
+- Processing Level comes from pipeline_stats.processing_level; if null or missing, write "Not available"
+- Reachable units comes from pipeline_stats.reachable_units; total units from pipeline_stats.total_units
+- Vulnerable count means dynamic-test eligible findings (same as dynamic-test scope), from results.dynamic_test_eligible
+- Per-Step Costs: iterate pipeline_stats.costs; compute totals by summing estimated and actual
+- Per-Step Durations: iterate pipeline_stats.durations; format seconds as "Xm Ys" (e.g., "2m 31s"); the "total" key is the overall duration
+- Skipped Steps: iterate pipeline_stats.skipped_steps; if the array is empty, write "No steps were skipped."
+- Do NOT output Confirmed Vulnerabilities, False Positives, or Methodology sections — the server appends them from pipeline data after your response ends at Skipped Steps. The appended Verified column uses: dynamic (dynamic test) > verified (Stage 2 confirmed/agreed) > static.
+- Do not add commentary or explanations outside the template

@@ -1,0 +1,39 @@
+# Gitleaks configuration for 911VulScan.
+# Scan the full git history in CI; never allow real API keys into the tree.
+# Do NOT path-allowlist tests/ or Markdown — only exact synthetic placeholders.
+title = "911VulScan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exact synthetic test placeholders only (no tests/ or *.md exemptions)"
+paths = [
+  # Local gitleaks binary extract (gitignored); not project source.
+  '''(^|/)tools/gitleaks/''',
+]
+regexes = [
+  '''^sk-test$''',
+  '''^sk-ant-test$''',
+  '''^sk-deepseek-test$''',
+  '''^sk-qwen-test$''',
+  '''^sk-from-cli$''',
+  '''^sk-from-env$''',
+  '''^sk-from-env-xx$''',
+  '''^sk-from-flag$''',
+  '''^sk-from-file$''',
+  '''^sk-good-key$''',
+  '''^sk-bad-key$''',
+  '''^sk-test-123$''',
+  '''^sk-test-bad-key$''',
+  '''^sk-test-key$''',
+  '''^sk-test-redact$''',
+  '''^sk-test-mask$''',
+  '''^sk-deepseek$''',
+]
+
+[[rules]]
+id = "vulscan-generic-api-key-assignment"
+description = "Hardcoded API key assignment in source or deploy scripts"
+regex = '''(?i)(?:api[_-]?key|deepseek_api_key|anthropic_api_key|openai_api_key|vulscan_llm_api_key)\s*=\s*["']?(sk-[a-zA-Z0-9_\-]{16,})["']?'''
+tags = ["key", "911vulscan"]

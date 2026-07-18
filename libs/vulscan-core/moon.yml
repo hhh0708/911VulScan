@@ -1,0 +1,38 @@
+$schema: "https://moonrepo.dev/schemas/project.json"
+
+id: "vulscan-core"
+type: "library"
+language: "python"
+tags: ["core", "python"]
+
+tasks:
+  # Install dependencies
+  install:
+    command: "pip install -e ."
+    inputs:
+      - "pyproject.toml"
+
+  # Run analysis on a dataset (path-based)
+  analyze:
+    command: "python -m vulscan analyze"
+    inputs:
+      - "vulscan/**/*"
+
+  # Parse a repository
+  parse:
+    command: "python -m vulscan parse"
+    inputs:
+      - "vulscan/**/*"
+
+  # Generate report
+  report:
+    command: "python -m vulscan report"
+    inputs:
+      - "vulscan/**/*"
+
+  # Run tests
+  test:
+    command: "pytest"
+    inputs:
+      - "vulscan/**/*"
+      - "tests/**/*"
