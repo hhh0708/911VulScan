@@ -1,8 +1,8 @@
 # Dynamic Verification — Production Status
 
-**Status: NOT production-ready** until the GitHub Actions workflow
-`.github/workflows/phase12-acceptance.yml` (`docker-dynamic-e2e` job) succeeds
-on a recorded commit.
+**Status: NOT production-ready** until the Docker dynamic E2E suite
+(`python -m pytest tests/test_phase12_docker_e2e.py -q` with
+`VULSCAN_REQUIRE_DOCKER_E2E=1`) succeeds on a recorded commit.
 
 ## Gate criteria
 
