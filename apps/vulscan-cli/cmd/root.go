@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/hhh0708/911vulscan-cli/internal/config"
+	isatty "github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )
 
@@ -74,6 +75,15 @@ func requireAPIKey() string {
 }
 
 func init() {
+	// Bare `vulscan` on a terminal opens the interactive console; anywhere
+	// else (pipes, CI) keep the classic help output so nothing can hang.
+	rootCmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if shouldEnterInteractive(os.Args, isatty.IsTerminal(os.Stdin.Fd()), isatty.IsTerminal(os.Stdout.Fd())) {
+			return runInteractive()
+		}
+		return cmd.Help()
+	}
+
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output raw JSON (machine-readable)")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "Suppress progress output")
 	rootCmd.PersistentFlags().StringVar(&apiKeyFlag, "api-key", "", "Anthropic API key (overrides config)")

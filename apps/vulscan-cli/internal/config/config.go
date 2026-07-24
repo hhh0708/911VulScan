@@ -18,6 +18,8 @@ import (
 // Config holds the persistent CLI configuration.
 type Config struct {
 	APIKey        string `json:"api_key,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	BaseURL       string `json:"base_url,omitempty"`
 	DefaultModel  string `json:"default_model,omitempty"`
 	ActiveProject string `json:"active_project,omitempty"`
 }

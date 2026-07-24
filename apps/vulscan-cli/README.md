@@ -12,6 +12,32 @@ cd apps/vulscan-cli && make build
 
 This compiles the Go source to `apps/vulscan-cli/bin/vulscan`.
 
+## Interactive mode
+
+Running bare `vulscan` on a terminal launches the interactive console: a
+loading animation, a status panel, and slash commands for the common flows:
+
+```
+vulscan > /help
+```
+
+| Command | Purpose |
+|---|---|
+| `/provider` | Select LLM provider (deepseek / anthropic / qwen / openai_compat) |
+| `/model` | Select model (default: `deepseek-v4-pro`) |
+| `/apikey` | Set and validate the API key (silent prompt, saved 0600) |
+| `/project` | Switch the active project |
+| `/scan` | Run static analysis on the active project |
+| `/dynamic` | Run Docker-isolated dynamic verification |
+| `/status` | Show current provider/model/key/project |
+| `/help` | List all commands |
+| `/exit` | Quit |
+
+Selections persist to `~/.config/vulscan/config.json`; environment variables
+(`VULSCAN_LLM_PROVIDER`, `VULSCAN_LLM_MODEL`, `VULSCAN_LLM_BASE_URL`) still
+take precedence. When stdin/stdout is not a TTY (pipes, CI), bare `vulscan`
+keeps printing the classic help text instead.
+
 ## Environment variables
 
 | Variable | Purpose |
